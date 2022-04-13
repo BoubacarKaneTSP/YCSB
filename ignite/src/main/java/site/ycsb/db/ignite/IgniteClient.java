@@ -16,21 +16,20 @@
  */
 package site.ycsb.db.ignite;
 
-import site.ycsb.*;
 import org.apache.ignite.binary.BinaryField;
 import org.apache.ignite.binary.BinaryObject;
 import org.apache.ignite.binary.BinaryObjectBuilder;
 import org.apache.ignite.binary.BinaryType;
-import org.apache.ignite.cache.CacheEntryProcessor;
 import org.apache.ignite.internal.util.typedef.F;
-
-import javax.cache.processor.EntryProcessorException;
-import javax.cache.processor.MutableEntry;
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import site.ycsb.ByteIterator;
+import site.ycsb.Status;
+import site.ycsb.StringByteIterator;
+
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 
 /**
@@ -66,14 +65,14 @@ public class IgniteClient extends IgniteAbstractClient {
   public Status read(String table, String key, Set<String> fields,
                      Map<String, ByteIterator> result) {
     try {
-      BinaryObject po = cache.get(key);
+      BinaryObject bo = cache.get(key);
 
-      if (po == null) {
+      if (bo == null) {
         return Status.NOT_FOUND;
       }
 
       if (binType == null) {
-        binType = po.type();
+        binType = bo.type();
       }
 
       for (String s : F.isEmpty(fields) ? binType.fieldNames() : fields) {
@@ -84,16 +83,17 @@ public class IgniteClient extends IgniteAbstractClient {
           fieldsCache.put(s, bfld);
         }
 
-        String val = bfld.value(po);
+        String val = bfld.value(bo);
         if (val != null) {
           result.put(s, new StringByteIterator(val));
         }
 
-        if (debug) {
-          log.info("table:{" + table + "}, key:{" + key + "}" + ", fields:{" + fields + "}");
-          log.info("fields in po{" + binType.fieldNames() + "}");
-          log.info("result {" + result + "}");
-        }
+      }
+
+      if (debug) {
+        log.info("table:{" + table + "}, key:{" + key + "}" + ", fields:{" + fields + "}");
+        log.info("fields in bo{" + binType.fieldNames() + "}");
+        log.info("result {" + result + "}");
       }
 
       return Status.OK;
@@ -119,8 +119,12 @@ public class IgniteClient extends IgniteAbstractClient {
   public Status update(String table, String key,
                        Map<String, ByteIterator> values) {
     try {
-      cache.invoke(key, new Updater(values));
-
+      BinaryObject bo = cache.get(key);
+      BinaryObjectBuilder bob = client.binary().builder(bo);
+      for (Map.Entry<String, ByteIterator> entry : values.entrySet()) {
+        bob.setField(entry.getKey(), entry.getValue().toString());
+      }
+      cache.put(key, bob.build());
       return Status.OK;
     } catch (Exception e) {
       log.error(String.format("Error updating key: %s", key), e);
@@ -143,14 +147,10 @@ public class IgniteClient extends IgniteAbstractClient {
   public Status insert(String table, String key,
                        Map<String, ByteIterator> values) {
     try {
-      BinaryObjectBuilder bob = cluster.binary().builder("CustomType");
+      BinaryObjectBuilder bob = client.binary().builder("CustomType");
 
       for (Map.Entry<String, ByteIterator> entry : values.entrySet()) {
         bob.setField(entry.getKey(), entry.getValue().toString());
-
-        if (debug) {
-          log.info(entry.getKey() + ":" + entry.getValue());
-        }
       }
 
       BinaryObject bo = bob.build();
@@ -159,6 +159,10 @@ public class IgniteClient extends IgniteAbstractClient {
         cache.put(key, bo);
       } else {
         throw new UnsupportedOperationException("Unexpected table name: " + table);
+      }
+
+      if (debug) {
+        log.info(bo);
       }
 
       return Status.OK;
@@ -188,43 +192,4 @@ public class IgniteClient extends IgniteAbstractClient {
     return Status.ERROR;
   }
 
-  /**
-   * Entry processor to update values.
-   */
-  public static class Updater implements CacheEntryProcessor<String, BinaryObject, Object> {
-    private String[] flds;
-    private String[] vals;
-
-    /**
-     * @param values Updated fields.
-     */
-    Updater(Map<String, ByteIterator> values) {
-      flds = new String[values.size()];
-      vals = new String[values.size()];
-
-      int idx = 0;
-      for (Map.Entry<String, ByteIterator> e : values.entrySet()) {
-        flds[idx] = e.getKey();
-        vals[idx] = e.getValue().toString();
-        ++idx;
-      }
-    }
-
-    /**
-     * {@inheritDoc}
-     */
-    @Override
-    public Object process(MutableEntry<String, BinaryObject> mutableEntry, Object... objects)
-              throws EntryProcessorException {
-      BinaryObjectBuilder bob = mutableEntry.getValue().toBuilder();
-
-      for (int i = 0; i < flds.length; ++i) {
-        bob.setField(flds[i], vals[i]);
-      }
-
-      mutableEntry.setValue(bob.build());
-
-      return null;
-    }
-  }
 }
