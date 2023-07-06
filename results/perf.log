@@ -1,0 +1,25 @@
+# started on Thu Jul  6 16:51:05 2023
+
+
+ Performance counter stats for 'python2 /home/kaneb/ApacheProject/YCSB/bin/ycsb run ignite -p hosts=127.0.0.1 -s -P /home/kaneb/ApacheProject/YCSB/workloads/workloada -threads 200 -p operationcount=10000000 -p recordcount=1000000':
+
+       22928705974      cache-references                                              (30.81%)
+        3011396948      cache-misses              #   13.134 % of all cache refs      (30.73%)
+      157330777367      branches                                                      (30.58%)
+        3043506445      branch-misses             #    1.93% of all branches          (30.53%)
+     1394314468867      cycles                                                        (30.60%)
+      816907278226      instructions              #    0.59  insn per cycle           (38.30%)
+      642175762084      l1d_pend_miss.pending_cycles_any                                     (38.36%)
+       19165569581      l2_rqsts.all_demand_miss                                      (38.53%)
+      924227317260      cycle_activity.stalls_total                                     (38.60%)
+      224248092770      L1-dcache-loads                                               (38.58%)
+       28243246214      L1-dcache-load-misses     #   12.59% of all L1-dcache accesses  (30.91%)
+        5518161303      LLC-loads                                                     (30.89%)
+         580554053      LLC-load-misses           #   10.52% of all LL-cache accesses  (30.88%)
+
+      50.446969344 seconds time elapsed
+
+     276.670362000 seconds user
+     358.228353000 seconds sys
+
+
