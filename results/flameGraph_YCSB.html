@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px 10px 22px 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {position: fixed; bottom: 0; margin: 0; padding: 2px 3px 2px 3px; outline: 1px solid #ffc000; display: none; overflow: hidden; white-space: nowrap; background-color: #ffffe0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {left: 0}
+	#match {right: 0}
+	#reset {cursor: pointer}
+	#canvas {width: 100%; height: 496px}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>CPU profile</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas'></canvas>
+<div id='hl'><span></span></div>
+<p id='status'></p>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = false;
+	const levels = Array(31);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xb2e1b2, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+		[0xcce880, 20, 20, 20],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title, inln, c1, int) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title,
+			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
+		});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inline-block' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				if (f != root) getSelection().removeAllRanges();
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				status.style.display = 'inline-block';
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.style.display = 'none';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	canvas.ondblclick = function() {
+		getSelection().selectAllChildren(hl);
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+
+f(0,0,30012,3,'all')
+f(1,0,29903,1,'Target.main')
+f(2,0,4251,2,'Target.method1',4251,0,0)
+f(3,4243,8,5,'asm_sysvec_apic_timer_interrupt')
+f(4,4243,1,5,'irqentry_exit_to_user_mode')
+f(5,4243,1,5,'exit_to_user_mode_prepare')
+f(6,4243,1,5,'task_work_run')
+f(7,4243,1,5,'task_numa_work')
+f(8,4243,1,5,'change_prot_numa')
+f(9,4243,1,5,'change_protection')
+f(10,4243,1,5,'flush_tlb_mm_range')
+f(11,4243,1,5,'on_each_cpu_cond_mask')
+f(12,4243,1,5,'smp_call_function_many_cond')
+f(4,4244,7,5,'sysvec_apic_timer_interrupt')
+f(5,4244,7,5,'irq_exit_rcu')
+f(6,4244,7,5,'do_softirq_own_stack')
+f(7,4244,7,5,'asm_call_sysvec_on_stack')
+f(8,4244,7,5,'__softirqentry_text_start')
+f(9,4244,7,5,'rcu_core')
+f(10,4244,6,5,'kmem_cache_free')
+f(11,4249,1,5,'refill_obj_stock')
+f(10,4250,1,5,'rcu_cblist_dequeue')
+f(2,4251,4253,2,'Target.method2',4253,0,0)
+f(3,8495,9,5,'asm_sysvec_apic_timer_interrupt')
+f(4,8495,5,5,'irqentry_exit_to_user_mode')
+f(5,8495,5,5,'exit_to_user_mode_prepare')
+f(6,8496,4,5,'task_work_run')
+f(7,8496,4,5,'task_numa_work')
+f(8,8496,4,5,'change_prot_numa')
+f(9,8496,4,5,'change_protection')
+f(10,8499,1,5,'__ptep_modify_prot_start')
+f(4,8500,4,5,'sysvec_apic_timer_interrupt')
+f(5,8500,4,5,'irq_exit_rcu')
+f(6,8500,4,5,'do_softirq_own_stack')
+f(7,8500,4,5,'asm_call_sysvec_on_stack')
+f(8,8500,4,5,'__softirqentry_text_start')
+f(9,8500,4,5,'rcu_core')
+f(10,8501,1,5,'file_free_rcu')
+f(10,8502,2,5,'kmem_cache_free')
+f(11,8502,1,5,'__slab_free')
+f(11,8503,1,5,'refill_obj_stock')
+f(2,8504,21399,1,'Target.method3',539,0,0)
+f(3,8676,20866,1,'java/io/File.list',6,0,0)
+f(4,8676,20866,1,'java/io/File.normalizedList',6,0,0)
+f(5,8680,2,2,'java/io/File.isInvalid',2,0,0)
+f(6,8680,2,2,'java/io/UnixFileSystem.isInvalid',2,0,0)
+f(7,8680,2,2,'java/lang/String.indexOf',2,0,0)
+f(8,8680,2,2,'java/lang/String.indexOf',2,0,0)
+f(9,8680,2,2,'java/lang/StringLatin1.indexOf',2,0,0)
+f(5,8682,20860,1,'java/io/UnixFileSystem.list')
+f(6,8703,11,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/libjava.so')
+f(6,8714,34,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(6,8748,11,3,'JNU_NewStringPlatform')
+f(6,8759,8284,3,'Java_java_io_UnixFileSystem_list')
+f(7,8832,3316,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/libjava.so')
+f(8,9023,3125,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(9,9363,2785,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(10,10853,1294,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(11,11168,956,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(12,11378,622,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(13,11733,182,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(14,11884,1,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(15,11884,1,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(16,11884,1,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(17,11884,1,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(18,11884,1,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(19,11884,1,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(20,11884,1,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(21,11884,1,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(22,11884,1,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(14,11885,29,5,'asm_exc_page_fault')
+f(15,11885,29,5,'exc_page_fault')
+f(16,11885,29,5,'do_user_addr_fault')
+f(17,11908,6,5,'handle_mm_fault')
+f(18,11912,1,5,'mpol_misplaced')
+f(19,11912,1,5,'should_numa_migrate_memory')
+f(20,11912,1,5,'page_cpupid_xchg_last')
+f(18,11913,1,5,'task_numa_fault')
+f(14,11914,1,5,'asm_sysvec_apic_timer_interrupt')
+f(15,11914,1,5,'sysvec_apic_timer_interrupt')
+f(16,11914,1,5,'irq_exit_rcu')
+f(17,11914,1,5,'do_softirq_own_stack')
+f(18,11914,1,5,'asm_call_sysvec_on_stack')
+f(19,11914,1,5,'__softirqentry_text_start')
+f(20,11914,1,5,'rcu_core')
+f(13,11915,48,3,'__memset_evex_unaligned_erms')
+f(14,11937,26,5,'asm_exc_page_fault')
+f(15,11937,26,5,'exc_page_fault')
+f(16,11937,26,5,'do_user_addr_fault')
+f(17,11952,1,5,'find_vma')
+f(18,11952,1,5,'vmacache_find')
+f(17,11953,9,5,'handle_mm_fault')
+f(17,11962,1,5,'up_read')
+f(13,11963,31,5,'asm_exc_page_fault')
+f(14,11963,31,5,'exc_page_fault')
+f(15,11963,31,5,'do_user_addr_fault')
+f(16,11984,1,5,'_cond_resched')
+f(16,11985,1,5,'find_vma')
+f(17,11985,1,5,'vmacache_find')
+f(16,11986,8,5,'handle_mm_fault')
+f(17,11991,1,5,'__ptep_modify_prot_start')
+f(17,11992,1,5,'mem_cgroup_from_task')
+f(17,11993,1,5,'task_numa_fault')
+f(13,11994,1,5,'asm_sysvec_apic_timer_interrupt')
+f(14,11994,1,5,'sysvec_apic_timer_interrupt')
+f(15,11994,1,5,'irq_exit_rcu')
+f(16,11994,1,5,'do_softirq_own_stack')
+f(17,11994,1,5,'asm_call_sysvec_on_stack')
+f(18,11994,1,5,'__softirqentry_text_start')
+f(19,11994,1,5,'rcu_core')
+f(20,11994,1,5,'kmem_cache_free')
+f(13,11995,5,3,'memset@plt')
+f(12,12000,106,3,'__memset_evex_unaligned_erms')
+f(13,12065,41,5,'asm_exc_page_fault')
+f(14,12065,41,5,'exc_page_fault')
+f(15,12065,41,5,'do_user_addr_fault')
+f(16,12090,3,5,'find_vma')
+f(17,12090,3,5,'vmacache_find')
+f(16,12093,13,5,'handle_mm_fault')
+f(17,12103,1,5,'_raw_spin_lock')
+f(17,12104,1,5,'task_numa_fault')
+f(17,12105,1,5,'vm_normal_page')
+f(12,12106,16,3,'__tls_get_addr')
+f(12,12122,1,3,'__tls_get_addr@plt')
+f(12,12123,1,3,'memset@plt')
+f(11,12124,22,3,'__tls_get_addr')
+f(11,12146,1,3,'__tls_get_addr@plt')
+f(10,12147,1,5,'asm_sysvec_apic_timer_interrupt')
+f(11,12147,1,5,'sysvec_apic_timer_interrupt')
+f(12,12147,1,5,'irq_exit_rcu')
+f(13,12147,1,5,'do_softirq_own_stack')
+f(14,12147,1,5,'asm_call_sysvec_on_stack')
+f(15,12147,1,5,'__softirqentry_text_start')
+f(16,12147,1,5,'rcu_core')
+f(17,12147,1,5,'_raw_spin_unlock_irqrestore')
+f(7,12148,1483,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(8,12771,858,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(9,13558,68,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(10,13575,19,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(11,13593,1,5,'asm_exc_page_fault')
+f(12,13593,1,5,'exc_page_fault')
+f(13,13593,1,5,'do_user_addr_fault')
+f(14,13593,1,5,'handle_mm_fault')
+f(10,13594,31,3,'__memset_evex_unaligned_erms')
+f(11,13599,26,5,'asm_exc_page_fault')
+f(12,13599,26,5,'exc_page_fault')
+f(13,13599,26,5,'do_user_addr_fault')
+f(14,13613,12,5,'handle_mm_fault')
+f(15,13623,1,5,'__ptep_modify_prot_start')
+f(15,13624,1,5,'mem_cgroup_from_task')
+f(10,13625,1,3,'memset@plt')
+f(9,13626,3,3,'__tls_get_addr')
+f(8,13629,2,5,'asm_sysvec_apic_timer_interrupt')
+f(9,13629,2,5,'sysvec_apic_timer_interrupt')
+f(10,13629,2,5,'irq_exit_rcu')
+f(11,13629,2,5,'do_softirq_own_stack')
+f(12,13629,2,5,'asm_call_sysvec_on_stack')
+f(13,13629,2,5,'__softirqentry_text_start')
+f(14,13629,2,5,'rcu_core')
+f(15,13630,1,5,'kmem_cache_free')
+f(7,13631,2806,3,'JNU_CopyObjectArray')
+f(8,13714,2723,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(9,14751,1686,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(10,16434,3,5,'asm_sysvec_apic_timer_interrupt')
+f(11,16434,2,5,'irqentry_exit_to_user_mode')
+f(12,16434,2,5,'exit_to_user_mode_prepare')
+f(13,16435,1,5,'task_work_run')
+f(14,16435,1,5,'task_numa_work')
+f(15,16435,1,5,'change_prot_numa')
+f(16,16435,1,5,'change_protection')
+f(17,16435,1,5,'vm_normal_page')
+f(11,16436,1,5,'sysvec_apic_timer_interrupt')
+f(12,16436,1,5,'irq_exit_rcu')
+f(13,16436,1,5,'do_softirq_own_stack')
+f(14,16436,1,5,'asm_call_sysvec_on_stack')
+f(15,16436,1,5,'__softirqentry_text_start')
+f(16,16436,1,5,'rcu_core')
+f(17,16436,1,5,'kmem_cache_free')
+f(18,16436,1,5,'refill_obj_stock')
+f(7,16437,69,3,'JNU_GetStringPlatformChars')
+f(8,16443,63,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(9,16478,28,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(10,16503,3,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(7,16506,256,3,'JNU_NewStringPlatform')
+f(7,16762,281,3,'[unknown]')
+f(8,16762,281,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(9,16762,4,3,'__fstat')
+f(9,16766,277,3,'__fstatat64')
+f(10,16766,277,5,'entry_SYSCALL_64_after_hwframe')
+f(11,16766,277,5,'do_syscall_64')
+f(12,16767,249,5,'__do_sys_newfstatat')
+f(13,16778,17,5,'cp_new_stat')
+f(14,16785,5,5,'_copy_to_user')
+f(15,16785,5,5,'copy_user_enhanced_fast_string')
+f(14,16790,2,5,'from_kgid_munged')
+f(15,16790,2,5,'map_id_up')
+f(14,16792,3,5,'from_kuid_munged')
+f(15,16792,3,5,'map_id_up')
+f(13,16795,221,5,'vfs_statx')
+f(14,16798,12,5,'ext4_getattr?[ext4]')
+f(15,16806,4,5,'generic_fillattr')
+f(14,16810,65,5,'filename_lookup')
+f(15,16817,18,5,'kmem_cache_free')
+f(16,16833,2,5,'slab_free_freelist_hook.constprop.0')
+f(15,16835,37,5,'path_lookupat')
+f(16,16835,1,5,'complete_walk')
+f(16,16836,3,5,'link_path_walk.part.0')
+f(16,16839,29,5,'path_init')
+f(17,16844,11,5,'__fget_light')
+f(18,16848,7,5,'__fget_files')
+f(17,16855,6,5,'fput_many')
+f(17,16861,7,5,'lockref_get')
+f(16,16868,2,5,'terminate_walk')
+f(16,16870,2,5,'walk_component')
+f(15,16872,3,5,'putname')
+f(14,16875,5,5,'mntput_no_expire')
+f(14,16880,9,5,'path_put')
+f(15,16880,9,5,'dput')
+f(16,16881,2,5,'_cond_resched')
+f(16,16883,6,5,'lockref_put_return')
+f(14,16889,43,5,'security_inode_getattr')
+f(15,16893,10,5,'apparmor_inode_getattr')
+f(15,16903,5,5,'tomoyo_inode_getattr')
+f(15,16908,24,5,'tomoyo_path_perm')
+f(16,16922,1,5,'asm_sysvec_apic_timer_interrupt')
+f(17,16922,1,5,'sysvec_apic_timer_interrupt')
+f(18,16922,1,5,'irq_exit_rcu')
+f(19,16922,1,5,'do_softirq_own_stack')
+f(20,16922,1,5,'asm_call_sysvec_on_stack')
+f(21,16922,1,5,'__softirqentry_text_start')
+f(22,16922,1,5,'rcu_core')
+f(23,16922,1,5,'_raw_spin_unlock_irqrestore')
+f(16,16923,9,5,'tomoyo_init_request_info')
+f(17,16930,2,5,'tomoyo_domain')
+f(14,16932,72,5,'user_path_at_empty')
+f(15,16935,69,5,'getname_flags.part.0')
+f(16,16937,25,5,'kmem_cache_alloc')
+f(17,16943,15,5,'memset_erms')
+f(17,16958,4,5,'slab_pre_alloc_hook.constprop.0')
+f(16,16962,42,5,'strncpy_from_user')
+f(17,16983,21,5,'__check_object_size')
+f(18,16990,8,5,'__check_heap_object')
+f(18,16998,5,5,'__virt_addr_valid')
+f(18,17003,1,5,'check_stack_object')
+f(14,17004,12,5,'vfs_getattr_nosec')
+f(12,17016,5,5,'__x64_sys_newfstatat')
+f(12,17021,22,5,'syscall_enter_from_user_mode')
+f(6,17043,11489,3,'[unknown]')
+f(7,17043,22,3,'__GI___libc_malloc')
+f(7,17065,1,3,'__alloc_dir')
+f(7,17066,42,3,'__fstatat64')
+f(8,17088,1,5,'asm_sysvec_apic_timer_interrupt')
+f(9,17088,1,5,'sysvec_apic_timer_interrupt')
+f(10,17088,1,5,'irq_exit_rcu')
+f(11,17088,1,5,'do_softirq_own_stack')
+f(12,17088,1,5,'asm_call_sysvec_on_stack')
+f(13,17088,1,5,'__softirqentry_text_start')
+f(14,17088,1,5,'rcu_core')
+f(15,17088,1,5,'kmem_cache_free')
+f(8,17089,19,5,'entry_SYSCALL_64_after_hwframe')
+f(9,17089,18,5,'do_syscall_64')
+f(10,17089,18,5,'__do_sys_newfstatat')
+f(11,17089,18,5,'cp_new_stat')
+f(12,17089,18,5,'_copy_to_user')
+f(13,17090,17,5,'copy_user_enhanced_fast_string')
+f(9,17107,1,5,'syscall_exit_to_user_mode')
+f(10,17107,1,5,'exit_to_user_mode_prepare')
+f(11,17107,1,5,'task_work_run')
+f(12,17107,1,5,'task_numa_work')
+f(13,17107,1,5,'change_prot_numa')
+f(14,17107,1,5,'change_protection')
+f(7,17108,28,3,'_int_free')
+f(7,17136,8,3,'_int_malloc')
+f(7,17144,11007,3,'getdents64')
+f(8,17186,90,5,'__find_get_block')
+f(8,17276,10874,5,'entry_SYSCALL_64_after_hwframe')
+f(9,17276,10868,5,'do_syscall_64')
+f(10,17276,10825,5,'__x64_sys_getdents64')
+f(11,17296,67,5,'__fdget_pos')
+f(12,17299,48,5,'__fget_light')
+f(13,17313,34,5,'__fget_files')
+f(12,17347,16,5,'mutex_lock')
+f(13,17362,1,5,'_cond_resched')
+f(14,17362,1,5,'rcu_all_qs')
+f(11,17363,10,5,'__put_user_nocheck_8')
+f(11,17373,1,5,'fput')
+f(11,17374,6,5,'fput_many')
+f(11,17380,10714,5,'iterate_dir')
+f(12,17390,1,5,'__x86_indirect_thunk_rax')
+f(12,17391,14,5,'down_read_killable')
+f(13,17404,1,5,'_cond_resched')
+f(12,17405,10608,5,'ext4_readdir?[ext4]')
+f(13,17549,1116,5,'call_filldir?[ext4]')
+f(14,17660,3,5,'__x86_indirect_thunk_rax')
+f(14,17663,1002,5,'filldir64')
+f(15,18355,310,5,'verify_dirent_name')
+f(16,18402,1,5,'asm_sysvec_apic_timer_interrupt')
+f(17,18402,1,5,'sysvec_apic_timer_interrupt')
+f(18,18402,1,5,'irq_exit_rcu')
+f(19,18402,1,5,'do_softirq_own_stack')
+f(20,18402,1,5,'asm_call_sysvec_on_stack')
+f(21,18402,1,5,'__softirqentry_text_start')
+f(22,18402,1,5,'rcu_core')
+f(23,18402,1,5,'kmem_cache_free')
+f(24,18402,1,5,'slab_free_freelist_hook.constprop.0')
+f(16,18403,262,5,'memchr')
+f(13,18665,8599,5,'ext4_htree_fill_tree?[ext4]')
+f(14,18790,78,5,'__brelse')
+f(14,18868,31,5,'_cond_resched')
+f(15,18884,15,5,'rcu_all_qs')
+f(14,18899,1224,5,'dx_probe?[ext4]')
+f(15,19312,811,5,'__ext4_read_dirblock?[ext4]')
+f(16,19347,776,5,'ext4_bread?[ext4]')
+f(17,19360,763,5,'ext4_getblk?[ext4]')
+f(18,19427,228,5,'__getblk_gfp')
+f(19,19441,195,5,'__find_get_block')
+f(20,19613,1,5,'asm_sysvec_apic_timer_interrupt')
+f(21,19613,1,5,'sysvec_apic_timer_interrupt')
+f(22,19613,1,5,'irq_exit_rcu')
+f(23,19613,1,5,'do_softirq_own_stack')
+f(24,19613,1,5,'asm_call_sysvec_on_stack')
+f(25,19613,1,5,'__softirqentry_text_start')
+f(26,19613,1,5,'rcu_core')
+f(27,19613,1,5,'kmem_cache_free')
+f(28,19613,1,5,'__slab_free')
+f(20,19614,22,5,'mark_page_accessed')
+f(19,19636,19,5,'_cond_resched')
+f(20,19651,4,5,'rcu_all_qs')
+f(18,19655,468,5,'ext4_map_blocks?[ext4]')
+f(19,19715,161,5,'__check_block_validity.constprop.0?[ext4]')
+f(20,19741,135,5,'ext4_inode_block_valid?[ext4]')
+f(21,19873,3,5,'rcu_read_unlock_strict')
+f(19,19876,247,5,'ext4_es_lookup_extent?[ext4]')
+f(20,20002,98,5,'_raw_read_lock')
+f(20,20100,2,5,'asm_sysvec_apic_timer_interrupt')
+f(21,20100,2,5,'sysvec_apic_timer_interrupt')
+f(22,20100,2,5,'irq_exit_rcu')
+f(23,20100,2,5,'do_softirq_own_stack')
+f(24,20100,2,5,'asm_call_sysvec_on_stack')
+f(25,20100,2,5,'__softirqentry_text_start')
+f(26,20100,2,5,'rcu_core')
+f(27,20100,1,5,'kmem_cache_free')
+f(28,20100,1,5,'refill_obj_stock')
+f(27,20101,1,5,'rcu_cblist_dequeue')
+f(20,20102,21,5,'percpu_counter_add_batch')
+f(21,20122,1,5,'_raw_spin_unlock_irqrestore')
+f(14,20123,78,5,'ext4_htree_next_block?[ext4]')
+f(14,20201,76,5,'ext4_htree_store_dirent?[ext4]')
+f(15,20214,50,5,'__kmalloc')
+f(16,20232,7,5,'kmalloc_slab')
+f(16,20239,7,5,'memcg_slab_post_alloc_hook')
+f(16,20246,9,5,'memset_erms')
+f(16,20255,9,5,'slab_pre_alloc_hook.constprop.0')
+f(17,20262,2,5,'_cond_resched')
+f(15,20264,10,5,'memcpy_erms')
+f(15,20274,3,5,'rb_insert_color')
+f(14,20277,6987,5,'htree_dirblock_to_tree?[ext4]')
+f(15,20575,100,5,'__brelse')
+f(15,20675,162,5,'__ext4_check_dir_entry?[ext4]')
+f(15,20837,2868,5,'__ext4_read_dirblock?[ext4]')
+f(16,21002,2703,5,'ext4_bread?[ext4]')
+f(17,21011,2694,5,'ext4_getblk?[ext4]')
+f(18,21091,1910,5,'__getblk_gfp')
+f(19,21123,1860,5,'__find_get_block')
+f(20,21945,115,5,'__brelse')
+f(21,22059,1,5,'asm_sysvec_apic_timer_interrupt')
+f(22,22059,1,5,'sysvec_apic_timer_interrupt')
+f(23,22059,1,5,'irq_exit_rcu')
+f(24,22059,1,5,'do_softirq_own_stack')
+f(25,22059,1,5,'asm_call_sysvec_on_stack')
+f(26,22059,1,5,'__softirqentry_text_start')
+f(27,22059,1,5,'rcu_core')
+f(28,22059,1,5,'kmem_cache_free')
+f(20,22060,125,5,'_raw_spin_lock')
+f(20,22185,798,5,'pagecache_get_page')
+f(21,22255,14,5,'PageHuge')
+f(21,22269,663,5,'find_get_entry')
+f(22,22538,1,5,'asm_sysvec_apic_timer_interrupt')
+f(23,22538,1,5,'sysvec_apic_timer_interrupt')
+f(24,22538,1,5,'irq_exit_rcu')
+f(25,22538,1,5,'do_softirq_own_stack')
+f(26,22538,1,5,'asm_call_sysvec_on_stack')
+f(27,22538,1,5,'__softirqentry_text_start')
+f(28,22538,1,5,'rcu_core')
+f(29,22538,1,5,'kmem_cache_free')
+f(22,22539,2,5,'rcu_read_unlock_strict')
+f(22,22541,391,5,'xas_load')
+f(23,22893,39,5,'xas_start')
+f(21,22932,51,5,'mark_page_accessed')
+f(22,22982,1,5,'asm_sysvec_apic_timer_interrupt')
+f(23,22982,1,5,'sysvec_apic_timer_interrupt')
+f(24,22982,1,5,'irq_exit_rcu')
+f(25,22982,1,5,'do_softirq_own_stack')
+f(26,22982,1,5,'asm_call_sysvec_on_stack')
+f(27,22982,1,5,'__softirqentry_text_start')
+f(28,22982,1,5,'rcu_core')
+f(29,22982,1,5,'kmem_cache_free')
+f(30,22982,1,5,'__slab_free')
+f(19,22983,18,5,'_cond_resched')
+f(20,22999,2,5,'rcu_all_qs')
+f(18,23001,1,5,'asm_sysvec_apic_timer_interrupt')
+f(19,23001,1,5,'sysvec_apic_timer_interrupt')
+f(20,23001,1,5,'irq_exit_rcu')
+f(21,23001,1,5,'do_softirq_own_stack')
+f(22,23001,1,5,'asm_call_sysvec_on_stack')
+f(23,23001,1,5,'__softirqentry_text_start')
+f(24,23001,1,5,'rcu_core')
+f(25,23001,1,5,'kmem_cache_free')
+f(18,23002,703,5,'ext4_map_blocks?[ext4]')
+f(19,23121,189,5,'__check_block_validity.constprop.0?[ext4]')
+f(20,23163,147,5,'ext4_inode_block_valid?[ext4]')
+f(21,23307,3,5,'rcu_read_unlock_strict')
+f(19,23310,395,5,'ext4_es_lookup_extent?[ext4]')
+f(20,23544,129,5,'_raw_read_lock')
+f(20,23673,1,5,'asm_sysvec_apic_timer_interrupt')
+f(21,23673,1,5,'sysvec_apic_timer_interrupt')
+f(22,23673,1,5,'irq_exit_rcu')
+f(23,23673,1,5,'do_softirq_own_stack')
+f(24,23673,1,5,'asm_call_sysvec_on_stack')
+f(25,23673,1,5,'__softirqentry_text_start')
+f(26,23673,1,5,'rcu_core')
+f(27,23673,1,5,'note_gp_changes')
+f(28,23673,1,5,'_raw_spin_unlock_irqrestore')
+f(20,23674,31,5,'percpu_counter_add_batch')
+f(21,23703,1,5,'_raw_spin_lock_irqsave')
+f(21,23704,1,5,'_raw_spin_unlock_irqrestore')
+f(15,23705,1,5,'asm_sysvec_apic_timer_interrupt')
+f(16,23705,1,5,'sysvec_apic_timer_interrupt')
+f(17,23705,1,5,'irq_exit_rcu')
+f(18,23705,1,5,'do_softirq_own_stack')
+f(19,23705,1,5,'asm_call_sysvec_on_stack')
+f(20,23705,1,5,'__softirqentry_text_start')
+f(21,23705,1,5,'rcu_core')
+f(22,23705,1,5,'kmem_cache_free')
+f(23,23705,1,5,'refill_obj_stock')
+f(15,23706,1019,5,'ext4_htree_store_dirent?[ext4]')
+f(16,23918,617,5,'__kmalloc')
+f(17,24137,32,5,'kmalloc_slab')
+f(17,24169,83,5,'memcg_slab_post_alloc_hook')
+f(17,24252,7,5,'memset')
+f(17,24259,169,5,'memset_erms')
+f(17,24428,107,5,'slab_pre_alloc_hook.constprop.0')
+f(18,24491,27,5,'_cond_resched')
+f(19,24509,9,5,'rcu_all_qs')
+f(18,24518,1,5,'asm_sysvec_apic_timer_interrupt')
+f(19,24518,1,5,'sysvec_apic_timer_interrupt')
+f(20,24518,1,5,'irq_exit_rcu')
+f(21,24518,1,5,'do_softirq_own_stack')
+f(22,24518,1,5,'asm_call_sysvec_on_stack')
+f(23,24518,1,5,'__softirqentry_text_start')
+f(24,24518,1,5,'rcu_core')
+f(25,24518,1,5,'kmem_cache_free')
+f(18,24519,16,5,'should_failslab')
+f(16,24535,159,5,'memcpy_erms')
+f(16,24694,31,5,'rb_insert_color')
+f(15,24725,2478,5,'ext4fs_dirhash?[ext4]')
+f(16,26112,7,5,'__x86_indirect_thunk_rax')
+f(16,26119,2,5,'asm_sysvec_apic_timer_interrupt')
+f(17,26119,2,5,'sysvec_apic_timer_interrupt')
+f(18,26119,2,5,'irq_exit_rcu')
+f(19,26119,2,5,'do_softirq_own_stack')
+f(20,26119,2,5,'asm_call_sysvec_on_stack')
+f(21,26119,2,5,'__softirqentry_text_start')
+f(22,26119,2,5,'rcu_core')
+f(23,26119,2,5,'kmem_cache_free')
+f(24,26119,2,5,'refill_obj_stock')
+f(16,26121,1082,5,'str2hashbuf_signed?[ext4]')
+f(17,27200,3,5,'asm_sysvec_apic_timer_interrupt')
+f(18,27200,3,5,'sysvec_apic_timer_interrupt')
+f(19,27200,3,5,'irq_exit_rcu')
+f(20,27200,3,5,'do_softirq_own_stack')
+f(21,27200,3,5,'asm_call_sysvec_on_stack')
+f(22,27200,3,5,'__softirqentry_text_start')
+f(23,27200,3,5,'rcu_core')
+f(24,27200,1,5,'file_free_rcu')
+f(24,27201,2,5,'kmem_cache_free')
+f(25,27202,1,5,'__slab_free')
+f(15,27203,61,5,'fscrypt_fname_free_buffer')
+f(16,27216,48,5,'kfree')
+f(13,27264,628,5,'free_rb_tree_fname?[ext4]')
+f(14,27312,543,5,'kfree')
+f(15,27768,87,5,'slab_free_freelist_hook.constprop.0')
+f(16,27854,1,5,'asm_sysvec_apic_timer_interrupt')
+f(17,27854,1,5,'sysvec_apic_timer_interrupt')
+f(18,27854,1,5,'irq_exit_rcu')
+f(19,27854,1,5,'do_softirq_own_stack')
+f(20,27854,1,5,'asm_call_sysvec_on_stack')
+f(21,27854,1,5,'__softirqentry_text_start')
+f(22,27854,1,5,'rcu_core')
+f(14,27855,7,5,'rb_first_postorder')
+f(14,27862,30,5,'rb_next_postorder')
+f(13,27892,7,5,'is_dx_dir?[ext4]')
+f(13,27899,21,5,'kmem_cache_alloc_trace')
+f(14,27911,2,5,'memcg_slab_post_alloc_hook')
+f(14,27913,4,5,'memset_erms')
+f(14,27917,3,5,'slab_pre_alloc_hook.constprop.0')
+f(13,27920,12,5,'rb_first')
+f(13,27932,81,5,'rb_next')
+f(12,28013,16,5,'fsnotify')
+f(12,28029,21,5,'security_file_permission')
+f(13,28032,10,5,'apparmor_file_permission')
+f(14,28038,4,5,'aa_file_perm')
+f(15,28041,1,5,'rcu_read_unlock_strict')
+f(13,28042,8,5,'fsnotify')
+f(12,28050,34,5,'touch_atime')
+f(13,28054,30,5,'atime_needs_update')
+f(14,28068,16,5,'current_time')
+f(15,28074,10,5,'ktime_get_coarse_real_ts64')
+f(12,28084,10,5,'up_read')
+f(11,28094,7,5,'mutex_unlock')
+f(10,28101,43,5,'syscall_enter_from_user_mode')
+f(9,28144,6,5,'syscall_exit_to_user_mode')
+f(10,28146,4,5,'exit_to_user_mode_prepare')
+f(11,28146,4,5,'task_work_run')
+f(12,28146,4,5,'task_numa_work')
+f(13,28146,4,5,'change_prot_numa')
+f(14,28146,4,5,'change_protection')
+f(8,28150,1,5,'kmem_cache_free')
+f(7,28151,2,3,'opendir_tail')
+f(7,28153,379,3,'readdir')
+f(6,28532,4,3,'__GI___libc_malloc')
+f(6,28536,619,3,'__GI___open_nocancel')
+f(7,28556,598,5,'entry_SYSCALL_64_after_hwframe')
+f(8,28556,595,5,'do_syscall_64')
+f(9,28556,565,5,'__x64_sys_openat')
+f(10,28560,561,5,'do_sys_openat2')
+f(11,28568,26,5,'__alloc_fd')
+f(12,28579,6,5,'_find_next_bit.constprop.0')
+f(12,28585,5,5,'_raw_spin_lock')
+f(12,28590,4,5,'expand_files')
+f(11,28594,3,5,'__fd_install')
+f(11,28597,4,5,'build_open_flags')
+f(11,28601,375,5,'do_filp_open')
+f(12,28603,373,5,'path_openat')
+f(13,28611,181,5,'alloc_empty_file')
+f(14,28612,179,5,'__alloc_file')
+f(15,28619,125,5,'kmem_cache_alloc')
+f(16,28634,6,5,'__slab_alloc')
+f(17,28635,5,5,'___slab_alloc')
+f(18,28635,5,5,'allocate_slab')
+f(19,28636,4,5,'__alloc_pages_nodemask')
+f(20,28636,4,5,'get_page_from_freelist')
+f(21,28637,3,5,'prep_new_page')
+f(22,28637,3,5,'kernel_init_free_pages')
+f(23,28637,3,5,'clear_page_erms')
+f(16,28640,41,5,'memcg_slab_post_alloc_hook')
+f(17,28679,2,5,'rcu_read_unlock_strict')
+f(16,28681,5,5,'memset_erms')
+f(16,28686,58,5,'slab_pre_alloc_hook.constprop.0')
+f(17,28690,36,5,'get_obj_cgroup_from_current')
+f(17,28726,18,5,'obj_cgroup_charge')
+f(18,28735,7,5,'__memcg_kmem_charge')
+f(19,28735,2,5,'page_counter_try_charge')
+f(19,28737,5,5,'try_charge')
+f(20,28740,2,5,'page_counter_try_charge')
+f(18,28742,2,5,'refill_obj_stock')
+f(15,28744,47,5,'security_file_alloc')
+f(16,28744,1,5,'__x86_indirect_thunk_rax')
+f(16,28745,27,5,'apparmor_file_alloc_security')
+f(16,28772,19,5,'kmem_cache_alloc')
+f(17,28778,2,5,'memcg_slab_post_alloc_hook')
+f(17,28780,8,5,'memset_erms')
+f(17,28788,3,5,'slab_pre_alloc_hook.constprop.0')
+f(18,28790,1,5,'_cond_resched')
+f(14,28791,1,5,'percpu_counter_add_batch')
+f(13,28792,15,5,'complete_walk')
+f(14,28792,15,5,'try_to_unlazy')
+f(15,28793,11,5,'__legitimize_path')
+f(16,28793,8,5,'__legitimize_mnt')
+f(16,28801,3,5,'lockref_get_not_dead')
+f(15,28804,2,5,'legitimize_links')
+f(15,28806,1,5,'legitimize_root')
+f(13,28807,100,5,'do_dentry_open')
+f(14,28826,2,5,'ext4_dir_open?[ext4]')
+f(14,28828,5,5,'file_ra_state_init')
+f(14,28833,4,5,'lockref_get')
+f(14,28837,2,5,'path_get')
+f(15,28837,2,5,'mntget')
+f(14,28839,68,5,'security_file_open')
+f(15,28843,18,5,'apparmor_file_open')
+f(15,28861,4,5,'fsnotify')
+f(15,28865,26,5,'tomoyo_check_open_permission')
+f(16,28874,6,5,'__srcu_read_lock')
+f(16,28880,5,5,'__srcu_read_unlock')
+f(16,28885,1,5,'kfree')
+f(16,28886,5,5,'tomoyo_init_request_info')
+f(15,28891,16,5,'tomoyo_file_open')
+f(16,28896,11,5,'tomoyo_domain')
+f(13,28907,12,5,'link_path_walk.part.0')
+f(14,28913,5,5,'inode_permission.part.0')
+f(15,28915,3,5,'generic_permission')
+f(14,28918,1,5,'security_inode_permission')
+f(13,28919,5,5,'lookup_fast')
+f(14,28922,2,5,'__d_lookup_rcu')
+f(13,28924,6,5,'may_open')
+f(14,28926,4,5,'inode_permission.part.0')
+f(15,28926,4,5,'generic_permission')
+f(16,28927,3,5,'get_acl')
+f(17,28928,2,5,'get_cached_acl')
+f(13,28930,23,5,'path_init')
+f(14,28937,16,5,'nd_jump_root')
+f(15,28944,9,5,'set_root')
+f(13,28953,14,5,'step_into')
+f(14,28961,6,5,'__lookup_mnt')
+f(13,28967,8,5,'terminate_walk')
+f(14,28968,6,5,'dput')
+f(15,28968,1,5,'_cond_resched')
+f(15,28969,5,5,'lockref_put_return')
+f(14,28974,1,5,'mntput_no_expire')
+f(13,28975,1,5,'vfs_open')
+f(11,28976,3,5,'fsnotify')
+f(11,28979,3,5,'get_unused_fd_flags')
+f(11,28982,125,5,'getname_flags.part.0')
+f(12,28985,54,5,'kmem_cache_alloc')
+f(13,29005,3,5,'memcg_slab_post_alloc_hook')
+f(13,29008,28,5,'memset_erms')
+f(13,29036,3,5,'slab_pre_alloc_hook.constprop.0')
+f(14,29038,1,5,'_cond_resched')
+f(12,29039,68,5,'strncpy_from_user')
+f(13,29058,49,5,'__check_object_size')
+f(14,29064,2,5,'__check_heap_object')
+f(14,29066,35,5,'__virt_addr_valid')
+f(14,29101,6,5,'check_stack_object')
+f(11,29107,13,5,'kmem_cache_free')
+f(12,29118,2,5,'slab_free_freelist_hook.constprop.0')
+f(11,29120,1,5,'putname')
+f(9,29121,30,5,'syscall_enter_from_user_mode')
+f(8,29151,3,5,'syscall_exit_to_user_mode')
+f(9,29153,1,5,'exit_to_user_mode_prepare')
+f(10,29153,1,5,'task_work_run')
+f(11,29153,1,5,'task_numa_work')
+f(12,29153,1,5,'change_prot_numa')
+f(13,29153,1,5,'change_protection')
+f(7,29154,1,5,'memcg_slab_post_alloc_hook')
+f(6,29155,2,3,'__alloc_dir')
+f(6,29157,336,3,'__close_nocancel')
+f(7,29188,305,5,'entry_SYSCALL_64_after_hwframe')
+f(8,29188,102,5,'do_syscall_64')
+f(9,29190,74,5,'__x64_sys_close')
+f(10,29199,11,5,'__close_fd')
+f(11,29200,10,5,'pick_file')
+f(12,29203,7,5,'_raw_spin_lock')
+f(10,29210,54,5,'filp_close')
+f(11,29213,22,5,'dnotify_flush')
+f(12,29216,19,5,'fsnotify_find_mark')
+f(13,29216,19,5,'fsnotify_grab_connector')
+f(14,29217,11,5,'__srcu_read_lock')
+f(14,29228,7,5,'__srcu_read_unlock')
+f(11,29235,26,5,'fput_many')
+f(12,29242,19,5,'task_work_add')
+f(11,29261,3,5,'locks_remove_posix')
+f(9,29264,26,5,'syscall_enter_from_user_mode')
+f(8,29290,203,5,'syscall_exit_to_user_mode')
+f(9,29291,202,5,'exit_to_user_mode_prepare')
+f(10,29299,47,5,'__rseq_handle_notify_resume')
+f(11,29312,6,5,'__get_user_8')
+f(11,29318,1,5,'__put_user_4')
+f(11,29319,22,5,'__put_user_nocheck_4')
+f(11,29341,5,5,'__put_user_nocheck_8')
+f(10,29346,1,5,'mem_cgroup_handle_over_high')
+f(10,29347,146,5,'task_work_run')
+f(11,29362,2,5,'____fput')
+f(11,29364,96,5,'__fput')
+f(12,29375,2,5,'_cond_resched')
+f(13,29375,2,5,'rcu_all_qs')
+f(12,29377,12,5,'dput')
+f(13,29382,3,5,'_cond_resched')
+f(14,29382,3,5,'rcu_all_qs')
+f(13,29385,4,5,'lockref_put_return')
+f(12,29389,30,5,'ext4_release_dir?[ext4]')
+f(13,29392,2,5,'free_rb_tree_fname?[ext4]')
+f(14,29392,2,5,'rb_first_postorder')
+f(13,29394,25,5,'kfree')
+f(14,29414,5,5,'slab_free_freelist_hook.constprop.0')
+f(12,29419,6,5,'fsnotify')
+f(12,29425,23,5,'kmem_cache_free')
+f(13,29447,1,5,'slab_free_freelist_hook.constprop.0')
+f(12,29448,1,5,'mntput_no_expire')
+f(12,29449,1,5,'percpu_counter_add_batch')
+f(12,29450,10,5,'security_file_free')
+f(13,29451,1,5,'__x86_indirect_thunk_rax')
+f(13,29452,8,5,'apparmor_file_free_security')
+f(11,29460,1,5,'_cond_resched')
+f(12,29460,1,5,'rcu_all_qs')
+f(11,29461,32,5,'call_rcu')
+f(6,29493,10,3,'__libc_free')
+f(6,29503,3,3,'_int_free')
+f(6,29506,1,3,'opendir@plt')
+f(6,29507,6,3,'opendir_tail')
+f(6,29513,27,3,'readdir')
+f(6,29540,2,3,'readdir64@plt')
+f(3,29542,361,2,'java/lang/String.hashCode',361,0,0)
+f(4,29542,361,2,'java/lang/StringLatin1.hashCode',361,0,0)
+f(5,29902,1,5,'asm_sysvec_apic_timer_interrupt')
+f(6,29902,1,5,'sysvec_apic_timer_interrupt')
+f(7,29902,1,5,'irq_exit_rcu')
+f(8,29902,1,5,'do_softirq_own_stack')
+f(9,29902,1,5,'asm_call_sysvec_on_stack')
+f(10,29902,1,5,'__softirqentry_text_start')
+f(11,29902,1,5,'rcu_core')
+f(12,29902,1,5,'kmem_cache_free')
+f(13,29902,1,5,'__slab_free')
+f(1,29903,6,3,'__futex_abstimed_wait_common')
+f(2,29904,5,5,'entry_SYSCALL_64_after_hwframe')
+f(3,29904,4,5,'do_syscall_64')
+f(4,29904,4,5,'__x64_sys_futex')
+f(5,29904,4,5,'do_futex')
+f(6,29904,4,5,'futex_wait')
+f(7,29904,3,5,'futex_wait_queue_me')
+f(8,29904,2,5,'_raw_spin_unlock_irqrestore')
+f(8,29906,1,5,'plist_add')
+f(7,29907,1,5,'futex_wait_setup')
+f(8,29907,1,5,'__get_user_nocheck_4')
+f(3,29908,1,5,'syscall_exit_to_user_mode')
+f(1,29909,103,3,'start_thread')
+f(2,29909,103,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(3,29909,103,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(4,29909,103,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(5,29909,103,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(6,29909,103,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(7,29910,102,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(8,30004,4,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(9,30004,4,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(10,30004,3,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(11,30005,2,3,'/usr/lib/jvm/java-11-openjdk-amd64/lib/server/libjvm.so')
+f(10,30007,1,3,'__memset_evex_unaligned_erms')
+f(11,30007,1,5,'asm_exc_page_fault')
+f(12,30007,1,5,'exc_page_fault')
+f(13,30007,1,5,'do_user_addr_fault')
+f(8,30008,1,3,'__GI___lll_lock_wake')
+f(8,30009,1,3,'__GI___pthread_mutex_unlock_usercnt')
+f(8,30010,1,3,'___pthread_mutex_lock')
+f(8,30011,1,5,'asm_sysvec_apic_timer_interrupt')
+f(9,30011,1,5,'sysvec_apic_timer_interrupt')
+f(10,30011,1,5,'irq_exit_rcu')
+f(11,30011,1,5,'do_softirq_own_stack')
+f(12,30011,1,5,'asm_call_sysvec_on_stack')
+f(13,30011,1,5,'__softirqentry_text_start')
+f(14,30011,1,5,'run_rebalance_domains')
+f(15,30011,1,5,'_raw_spin_unlock_irqrestore')
+
+search();
+</script></body></html>
